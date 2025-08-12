@@ -1,11 +1,6 @@
 name: Build & Push Docker image
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - '**.md'
   pull_request_target:
     branches:
       - main
@@ -15,6 +10,10 @@ on:
     types:
       - labeled
       - synchronize
+  workflow_run:
+    workflows: ['Release']
+    types:
+      - completed
 
   workflow_dispatch:
 
@@ -64,11 +63,16 @@ jobs:
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
+
         with:
           images: ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv
           tags: |
             type=ref,event=pr
             type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Get latest tag
+        run: |
+          echo "latest_tag=$(curl -s https://api.github.com/repos/${{ github.repository }}/tags | jq -r '.[0].name // "latest"' | sed 's/^v//')" >> $GITHUB_ENV
 
       - name: Build and push by digest
         id: build
@@ -78,7 +82,8 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv,push-by-digest=true,name-canonical=true,push=true
+          tags: ${{ github.event_name == 'pull_request_target' && format('ghcr.io/{0}/moontv:pr-{1}', steps.lowercase.outputs.owner, github.event.number) || format('ghcr.io/{0}/moontv:{1}', steps.lowercase.outputs.owner, env.latest_tag) }}
+          outputs: type=image,name=ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv,name-canonical=true,push=true
 
       - name: Export digest
         run: |
@@ -94,10 +99,11 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
+  merge-pr:
     runs-on: ubuntu-latest
     needs:
       - build
+    if: github.event_name == 'pull_request_target'
     steps:
       - name: Download digests
         uses: actions/download-artifact@v4
@@ -120,14 +126,51 @@ jobs:
         id: lowercase
         run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create -t ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv:pr-${{ github.event.number }} \
+            $(printf 'ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv@sha256:%s ' *)
+
+  merge:
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    if: github.event_name != 'pull_request_target'
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set lowercase repository owner
+        id: lowercase
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest tag
+        run: |
+          echo "latest_tag=$(curl -s https://api.github.com/repos/${{ github.repository }}/tags | jq -r '.[0].name // "latest"' | sed 's/^v//')" >> $GITHUB_ENV
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ steps.lowercase.outputs.owner }}/moontv
           tags: |
-            type=ref,event=pr,prefix=pr-
             type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ env.latest_tag }},enable=true
 
       - name: Create manifest list and push
         working-directory: /tmp/digests
@@ -142,7 +185,7 @@ jobs:
   pr-comment:
     runs-on: ubuntu-latest
     needs:
-      - merge
+      - merge-pr
     if: github.event_name == 'pull_request_target'
     steps:
       - name: Set lowercase repository owner
@@ -171,7 +214,7 @@ jobs:
             构建完成时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
             });
 
-  cleanup:
+  cleanup-refresh:
     runs-on: ubuntu-latest
     needs:
       - merge
@@ -184,13 +227,6 @@ jobs:
           repository: ${{ github.repository }}
           retain_days: 0
           keep_minimum_runs: 2
-
-  version-cache-refresh:
-    runs-on: ubuntu-latest
-    needs:
-      - cleanup
-    if: always() && github.event_name != 'pull_request_target'
-    steps:
       - name: Refresh VERSION.txt cache
         run: |
           echo "Refreshing VERSION.txt cache..."
